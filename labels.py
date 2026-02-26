@@ -3,6 +3,8 @@ labels.py — Ground truth, taint, sanitizer label生成 + マーカー解決
 
 テンプレート内の SOURCE/SINK/SANITIZER マーカーを行番号に解決し、
 ground_truth_labels.csv, taint/sanitizer flow labels, manifest.json を生成する。
+
+Validation functions are in validators.py.
 """
 
 import csv
@@ -25,8 +27,10 @@ class VulnInstance:
     category_jp: str        # 日本語カテゴリ名
     function_name: str      # function containing the SINK
     source_line: int = 0    # resolved line number of SOURCE marker
-    sink_line: int = 0      # resolved line number of SINK marker (= ground truth代表行)
+    sink_line: int = 0      # resolved line number of SINK marker (= ラベル行 / 代表行)
     sanitizer_line: Optional[int] = None  # resolved line of SANITIZER (None if absent)
+    group_start: int = 0    # 検知グループ先頭行 (inclusive)
+    group_end: int = 0      # 検知グループ末尾行 (inclusive)
 
 
 @dataclass
@@ -66,7 +70,7 @@ CATEGORY_MAP = {
 CATEGORY_PREFIX_MAP = {
     "unencrypted_output": "UDO",
     "weak_input_validation": "IVW",
-    "shared_memory_overwrite": "SMO",
+    "shared_memory_overwrite": "DUS",
 }
 
 
@@ -106,42 +110,55 @@ def extract_sink_lines(source_code: str) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Safe invariant validation
+# Detection group computation
 # ---------------------------------------------------------------------------
 
-# Secret variable names used in UDO templates
-SECRET_VAR_PATTERN = re.compile(r'\bsecret\b')
+_MAX_GROUP_EXPAND = 5  # safety limit for backward/forward expansion
 
 
-def validate_safe_invariant(safe_source: str, category: str) -> list[str]:
-    """Validate that safe version's SINK lines don't reference 'secret' variable.
+def _is_stmt_boundary(line_text: str) -> bool:
+    """Return True if line_text ends a C statement (;) or block ({/})."""
+    clean = MARKER_RE.sub("", line_text).strip()
+    if not clean:
+        return True
+    return clean[-1] in (";", "{", "}")
 
-    Only applicable to UDO variants.
+
+def compute_detection_group(source_code: str, sink_line: int) -> tuple[int, int]:
+    """Compute the detection group line range around a SINK line.
+
+    The detection group covers the full C statement containing the SINK,
+    including multi-line function calls (e.g. snprintf spanning 2 lines).
+    A tool reporting ANY line within [group_start, group_end] is counted
+    as having detected this vulnerability instance.
 
     Returns:
-        List of error messages (empty = passed)
+        (group_start, group_end) — 1-indexed, inclusive
     """
-    if category != "unencrypted_output":
-        return []
+    lines = source_code.splitlines()
+    n = len(lines)
+    if sink_line < 1 or sink_line > n:
+        return (sink_line, sink_line)
 
-    errors = []
-    markers = extract_markers(safe_source)
-    lines = safe_source.splitlines()
+    # Walk backward: include continuation lines of the same statement
+    start = sink_line
+    for _ in range(_MAX_GROUP_EXPAND):
+        if start <= 1:
+            break
+        if _is_stmt_boundary(lines[start - 2]):  # line above is a boundary
+            break
+        start -= 1
 
-    for instance_id, marker_lines in markers.items():
-        sink_line = marker_lines.get("SINK")
-        if sink_line is None:
-            continue
-        # Check the SINK line itself
-        line_content = lines[sink_line - 1] if sink_line <= len(lines) else ""
-        # Remove the marker comment itself before checking
-        line_content_no_marker = MARKER_RE.sub("", line_content)
-        if SECRET_VAR_PATTERN.search(line_content_no_marker):
-            errors.append(
-                f"Safe invariant violation: 'secret' found on SINK line {sink_line} "
-                f"for instance {instance_id}"
-            )
-    return errors
+    # Walk forward: current line may not yet end the statement
+    end = sink_line
+    for _ in range(_MAX_GROUP_EXPAND):
+        if _is_stmt_boundary(lines[end - 1]):
+            break
+        if end >= n:
+            break
+        end += 1
+
+    return (start, end)
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +170,18 @@ def build_ground_truth_rows(
 ) -> list[dict]:
     """Build ground truth label rows.
 
-    Each row: Line Number, Category, Category_JP, Function, Label ID, Group
-    The representative line = SINK marker line.
+    Each row contains:
+    - Line Number: ラベル行 (SINK marker line = 代表行)
+    - Det Start / Det End: 検知グループ (同一処理範囲)
+    - Category, Category_JP, Function, Label ID, Group
     """
     rows = []
     for vi in vuln_instances:
         prefix = CATEGORY_PREFIX_MAP.get(vi.category, "UNK")
         rows.append({
             "Line Number": vi.sink_line,
+            "Det Start": vi.group_start,
+            "Det End": vi.group_end,
             "Category": vi.category,
             "Category_JP": vi.category_jp,
             "Function": vi.function_name,
@@ -173,7 +194,10 @@ def build_ground_truth_rows(
 def write_ground_truth_csv(rows: list[dict], output_path: Path) -> None:
     """Write ground truth labels CSV."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["Line Number", "Category", "Category_JP", "Function", "Label ID", "Group"]
+    fieldnames = [
+        "Line Number", "Det Start", "Det End",
+        "Category", "Category_JP", "Function", "Label ID", "Group",
+    ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -241,10 +265,35 @@ def write_manifest(
     safe_fix_description: str,
     vuln_instances: list[VulnInstance],
     output_path: Path,
+    vuln_markers: Optional[list[dict]] = None,
 ) -> None:
     """Write manifest.json for a variant."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     category, category_jp = CATEGORY_MAP.get(category_key, (category_key, ""))
+
+    # Build a lookup for shared references
+    marker_by_id: dict[str, dict] = {}
+    if vuln_markers:
+        for vm in vuln_markers:
+            marker_by_id[vm["id"]] = vm
+
+    labels = []
+    for vi in vuln_instances:
+        entry: dict = {
+            "instance_id": vi.instance_id,
+            "sink_line": vi.sink_line,
+            "det_group": [vi.group_start, vi.group_end],
+            "source_line": vi.source_line,
+            "sanitizer_line": vi.sanitizer_line,
+            "function": vi.function_name,
+        }
+        vm = marker_by_id.get(vi.instance_id, {})
+        if "shared_source" in vm:
+            entry["shared_source"] = vm["shared_source"]
+        if "shared_sanitizer" in vm:
+            entry["shared_sanitizer"] = vm["shared_sanitizer"]
+        labels.append(entry)
+
     manifest = {
         "variant_id": variant_id,
         "variant_name": variant_name,
@@ -254,16 +303,7 @@ def write_manifest(
         "structural_features": structural_features,
         "safe_fix_description": safe_fix_description,
         "instance_count": len(vuln_instances),
-        "labels": [
-            {
-                "instance_id": vi.instance_id,
-                "sink_line": vi.sink_line,
-                "source_line": vi.source_line,
-                "sanitizer_line": vi.sanitizer_line,
-                "function": vi.function_name,
-            }
-            for vi in vuln_instances
-        ],
+        "labels": labels,
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
@@ -277,34 +317,59 @@ def resolve_vuln_instances(
     source_code: str,
     vuln_markers: list[dict],
     category_key: str,
+    safe_source: Optional[str] = None,
 ) -> list[VulnInstance]:
     """Resolve SINK/SOURCE/SANITIZER markers to line numbers and build VulnInstances.
 
+    Two-pass resolution:
+      1. Resolve all instances that have their own markers in C code.
+      2. For instances with shared_source/shared_sanitizer, inherit line numbers
+         from the referenced instance.
+
     Args:
-        source_code: Complete entry.c source
-        vuln_markers: List of {"id": "v001-i01", "function": "func_name"}
+        source_code: Complete entry.c source (unsafe version)
+        vuln_markers: List of {"id": "v001-i01", "function": "func_name",
+                       "shared_source": "v001-i01",      (optional)
+                       "shared_sanitizer": "v001-i01"}    (optional)
         category_key: "UDO" / "IVW" / "DUS"
+        safe_source: Complete entry.c source (safe version) for SANITIZER resolution
 
     Returns:
         List of VulnInstance with resolved line numbers
     """
     markers = extract_markers(source_code)
+    safe_markers = extract_markers(safe_source) if safe_source else {}
     category, category_jp = CATEGORY_MAP.get(category_key, (category_key, ""))
 
+    # Pass 1: resolve instances from their own markers
     instances = []
+    instance_map: dict[str, VulnInstance] = {}
     for vm in vuln_markers:
         instance_id = vm["id"]
         function_name = vm["function"]
         resolved = markers.get(instance_id, {})
+        safe_resolved = safe_markers.get(instance_id, {})
 
-        instances.append(VulnInstance(
+        vi = VulnInstance(
             instance_id=instance_id,
             category=category,
             category_jp=category_jp,
             function_name=function_name,
             source_line=resolved.get("SOURCE", 0),
             sink_line=resolved.get("SINK", 0),
-            sanitizer_line=resolved.get("SANITIZER"),
-        ))
+            sanitizer_line=safe_resolved.get("SANITIZER") or resolved.get("SANITIZER"),
+        )
+        instances.append(vi)
+        instance_map[instance_id] = vi
+
+    # Pass 2: inherit from shared references
+    for vm, vi in zip(vuln_markers, instances):
+        shared_src = vm.get("shared_source")
+        if shared_src and shared_src in instance_map:
+            vi.source_line = instance_map[shared_src].source_line
+
+        shared_san = vm.get("shared_sanitizer")
+        if shared_san and shared_san in instance_map:
+            vi.sanitizer_line = instance_map[shared_san].sanitizer_line
 
     return instances

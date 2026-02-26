@@ -3,16 +3,21 @@ templates.py — 25 template functions for RQ3 dataset generation.
 
 Each template function returns a TemplateResult containing:
 - unsafe_body / safe_body: C function code for the variant
-- vuln_markers: list of {"id": "vNNN-iNN", "function": "func_name"}
+- vuln_markers: list of {"id": "vNNN-iNN", "function": "func_name",
+                          "shared_source": "vNNN-iNN",    (optional)
+                          "shared_sanitizer": "vNNN-iNN"}  (optional)
 - taint_flow: list of TaintCheckpoint definitions
 - sanitizers: list of SanitizerEntry definitions
 - param_types_hex: TEE_PARAM_TYPES value for the host side
 
 Conventions:
+- 1 line = 1 marker.  When multiple instances share the same SOURCE or
+  SANITIZER, only i01 carries the marker in C code; i02+ reference i01 via
+  shared_source / shared_sanitizer in vuln_markers.  resolve_vuln_instances()
+  inherits the line number from the referenced instance.
 - UDO: secret[] / enc_out[] separation; safe version uses enc_out only at sink
 - IVW: safe version adds proper bounds check before sink
 - DUS: safe version copies shm to local buffer before validation+use
-- Markers: /* SOURCE:id */ /* SINK:id */ /* SANITIZER:id */ embedded in code
 """
 
 from dataclasses import dataclass, field
@@ -86,7 +91,7 @@ static void helper_level3(TEE_Param params[4])
 \thelper_level2(params[1].memref.buffer, params[1].memref.size,
 \t              enc_out, strlen(enc_out));
 \tsnprintf(params[2].memref.buffer, params[2].memref.size,
-\t         "key=%s", enc_out); /* SANITIZER:v001-i02 */
+\t         "key=%s", enc_out);
 }
 
 static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
@@ -105,7 +110,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v001-i01", "function": "helper_level1"},
-            {"id": "v001-i02", "function": "helper_level3"},
+            {"id": "v001-i02", "function": "helper_level3",
+             "shared_source": "v001-i01", "shared_sanitizer": "v001-i01"},
         ],
         param_types_hex=0x0660,
     )
@@ -246,8 +252,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v003-i01", "function": "cmd_process"},
-            {"id": "v003-i02", "function": "cmd_process"},
-            {"id": "v003-i03", "function": "cmd_process"},
+            {"id": "v003-i02", "function": "cmd_process",
+             "shared_source": "v003-i01", "shared_sanitizer": "v003-i01"},
+            {"id": "v003-i03", "function": "cmd_process",
+             "shared_source": "v003-i01", "shared_sanitizer": "v003-i01"},
         ],
         param_types_hex=0x0660,
     )
@@ -307,7 +315,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v004-i01", "function": "write_via_ptr"},
-            {"id": "v004-i02", "function": "write_via_ptr"},
+            {"id": "v004-i02", "function": "write_via_ptr",
+             "shared_source": "v004-i01", "shared_sanitizer": "v004-i01"},
         ],
         param_types_hex=0x0660,
     )
@@ -357,7 +366,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v005-i01", "function": "cmd_process"},
-            {"id": "v005-i02", "function": "cmd_process"},
+            {"id": "v005-i02", "function": "cmd_process",
+             "shared_source": "v005-i01", "shared_sanitizer": "v005-i01"},
         ],
         param_types_hex=0x0660,
     )
@@ -402,7 +412,7 @@ static void derive_and_output(TEE_Param params[4])
 \tmemcpy(enc_out, derived, strlen(derived) + 1);
 \tenc(enc_out); /* SANITIZER:v006-i01 */
 \tmemcpy(params[1].memref.buffer, enc_out, strlen(enc_out));
-\tparams[0].value.a = 0;
+\tparams[0].value.a = 0; /* SANITIZER:v006-i02 */
 }
 
 static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
@@ -421,7 +431,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v006-i01", "function": "derive_and_output"},
-            {"id": "v006-i02", "function": "derive_and_output"},
+            {"id": "v006-i02", "function": "derive_and_output",
+             "shared_source": "v006-i01"},
         ],
         param_types_hex=0x0030,
     )
@@ -482,8 +493,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
-\tchar secret[64] = "PartialKey_ABC"; /* SOURCE:v008-i01 */
-\tchar secret_iv[32] = "IV_LEAKED_XYZ"; /* SOURCE:v008-i02 */
+\tchar secret[64] = "PartialKey_ABC";
+\tchar secret_iv[32] = "IV_LEAKED_XYZ"; /* SOURCE:v008-i01 */
 \tenc(secret);
 \tTEE_MemMove(params[1].memref.buffer, secret, strlen(secret));
 \tsnprintf(params[2].memref.buffer, params[2].memref.size,
@@ -504,9 +515,9 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \tchar enc_out[64];
 \tchar enc_out_iv[32];
 \tmemcpy(enc_out, secret, strlen(secret) + 1);
-\tenc(enc_out); /* SANITIZER:v008-i01 */
+\tenc(enc_out);
 \tmemcpy(enc_out_iv, secret_iv, strlen(secret_iv) + 1);
-\tenc(enc_out_iv); /* SANITIZER:v008-i02 */
+\tenc(enc_out_iv); /* SANITIZER:v008-i01 */
 \tTEE_MemMove(params[1].memref.buffer, enc_out, strlen(enc_out));
 \tsnprintf(params[2].memref.buffer, params[2].memref.size,
 \t         "%s", enc_out_iv);
@@ -537,8 +548,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
-\tchar *str = TEE_Malloc(1000, 0); /* SOURCE:v009-i01 */
-\tint offset = params[0].value.a;
+\tchar *str = TEE_Malloc(1000, 0);
+\tint offset = params[0].value.a; /* SOURCE:v009-i01 */
 \t*(str + offset) = 'A'; /* SINK:v009-i01 */
 \tchar val = *(str + offset - 1); /* SINK:v009-i02 */
 \t(void)val;
@@ -570,7 +581,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v009-i01", "function": "cmd_process"},
-            {"id": "v009-i02", "function": "cmd_process"},
+            {"id": "v009-i02", "function": "cmd_process",
+             "shared_source": "v009-i01", "shared_sanitizer": "v009-i01"},
         ],
         param_types_hex=0x0001,
     )
@@ -586,13 +598,15 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
-\tchar buf[256]; /* SOURCE:v010-i01 */
+\tchar buf[256];
+\tuint32_t sz = params[1].memref.size; /* SOURCE:v010-i01 */
+\tuint32_t alloc_val = params[0].value.a; /* SOURCE:v010-i02 */
 \tuint32_t i = 0;
-\twhile (i < params[1].memref.size) { /* SINK:v010-i01 */
+\twhile (i < sz) { /* SINK:v010-i01 */
 \t\tbuf[i] = ((char *)params[1].memref.buffer)[i];
 \t\ti++;
 \t}
-\tint *arr = TEE_Malloc(params[0].value.a, 0); /* SINK:v010-i02 */
+\tint *arr = TEE_Malloc(alloc_val, 0); /* SINK:v010-i02 */
 \t(void)arr;
 \treturn TEE_SUCCESS;
 }
@@ -606,16 +620,18 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
 \tchar buf[256];
-\tif (params[1].memref.size > 256)
+\tuint32_t sz = params[1].memref.size;
+\tuint32_t alloc_val = params[0].value.a;
+\tif (sz > 256)
 \t\treturn TEE_ERROR_BAD_PARAMETERS; /* SANITIZER:v010-i01 */
-\tif (params[0].value.a > 10000)
+\tif (alloc_val > 10000)
 \t\treturn TEE_ERROR_BAD_PARAMETERS; /* SANITIZER:v010-i02 */
 \tuint32_t i = 0;
-\twhile (i < params[1].memref.size) {
+\twhile (i < sz) {
 \t\tbuf[i] = ((char *)params[1].memref.buffer)[i];
 \t\ti++;
 \t}
-\tint *arr = TEE_Malloc(params[0].value.a, 0);
+\tint *arr = TEE_Malloc(alloc_val, 0);
 \t(void)arr;
 \treturn TEE_SUCCESS;
 }
@@ -640,8 +656,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INPUT,
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
-\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS; /* SOURCE:v011-i01 */
-\tint size = (int)params[1].memref.size;
+\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
+\tint size = (int)params[1].memref.size; /* SOURCE:v011-i01 */
 \tif (size > 0) {
 \t\tchar *buf = TEE_Malloc(size, 0); /* SINK:v011-i01 */
 \t\tTEE_MemMove(buf, params[1].memref.buffer, size); /* SINK:v011-i02 */
@@ -672,7 +688,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v011-i01", "function": "cmd_process"},
-            {"id": "v011-i02", "function": "cmd_process"},
+            {"id": "v011-i02", "function": "cmd_process",
+             "shared_source": "v011-i01", "shared_sanitizer": "v011-i01"},
         ],
         param_types_hex=0x0041,
     )
@@ -688,14 +705,15 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
-\tchar *str = TEE_Malloc(1000, 0); /* SOURCE:v012-i01 */
+\tuint32_t val = params[0].value.a; /* SOURCE:v012-i01 */
+\tchar *str = TEE_Malloc(1000, 0);
 \tint tmp_arr[20];
-\tif (params[0].value.a > 0) {
-\t\ttmp_arr[params[0].value.a] = 42; /* SINK:v012-i01 */
-\t\tint *arr = TEE_Malloc(params[0].value.a, 0); /* SINK:v012-i02 */
+\tif (val > 0) {
+\t\ttmp_arr[val] = 42; /* SINK:v012-i01 */
+\t\tint *arr = TEE_Malloc(val, 0); /* SINK:v012-i02 */
 \t\t(void)arr;
 \t} else {
-\t\tif (params[0].value.a > 1000) {
+\t\tif (val > 1000) {
 \t\t\treturn TEE_ERROR_BAD_PARAMETERS;
 \t\t}
 \t}
@@ -711,13 +729,14 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
 \tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
+\tuint32_t val = params[0].value.a;
 \tchar *str = TEE_Malloc(1000, 0);
 \tint tmp_arr[20];
-\tif (params[0].value.a >= 20)
+\tif (val >= 20)
 \t\treturn TEE_ERROR_BAD_PARAMETERS; /* SANITIZER:v012-i01 */
-\tif (params[0].value.a > 0) {
-\t\ttmp_arr[params[0].value.a] = 42;
-\t\tint *arr = TEE_Malloc(params[0].value.a, 0);
+\tif (val > 0) {
+\t\ttmp_arr[val] = 42;
+\t\tint *arr = TEE_Malloc(val, 0);
 \t\t(void)arr;
 \t}
 \tTEE_Free(str);
@@ -729,7 +748,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v012-i01", "function": "cmd_process"},
-            {"id": "v012-i02", "function": "cmd_process"},
+            {"id": "v012-i02", "function": "cmd_process",
+             "shared_source": "v012-i01", "shared_sanitizer": "v012-i01"},
         ],
         param_types_hex=0x0061,
     )
@@ -744,9 +764,9 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
-\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS; /* SOURCE:v013-i01 */
+\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
 \tchar buf[256];
-\tuint32_t idx = params[0].value.a;
+\tuint32_t idx = params[0].value.a; /* SOURCE:v013-i01 */
 \tif (idx <= 256) {
 \t\tbuf[idx] = 'X'; /* SINK:v013-i01 */
 \t}
@@ -788,9 +808,9 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
-\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS; /* SOURCE:v014-i01 */
+\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
 \tint arr[100];
-\tuint32_t val = params[0].value.a;
+\tuint32_t val = params[0].value.a; /* SOURCE:v014-i01 */
 \tint idx = val * 4 + 3;
 \tarr[idx] = 99; /* SINK:v014-i01 */
 \tchar *buf = TEE_Malloc(val * 8, 0); /* SINK:v014-i02 */
@@ -822,7 +842,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v014-i01", "function": "cmd_process"},
-            {"id": "v014-i02", "function": "cmd_process"},
+            {"id": "v014-i02", "function": "cmd_process",
+             "shared_source": "v014-i01", "shared_sanitizer": "v014-i01"},
         ],
         param_types_hex=0x0061,
     )
@@ -837,10 +858,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INPUT,
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE);
-\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS; /* SOURCE:v015-i01 */
+\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
 \tchar *str = TEE_Malloc(1000, 0);
-\tuint32_t a = params[0].value.a;
-\tuint32_t sz = params[1].memref.size;
+\tuint32_t a = params[0].value.a; /* SOURCE:v015-i01 */
+\tuint32_t sz = params[1].memref.size; /* SOURCE:v015-i02 */
 \tif (a < 1000 || sz < 1000) {
 \t\tstr[a] = 'Z'; /* SINK:v015-i01 */
 \t\tTEE_MemMove(str, params[1].memref.buffer, sz); /* SINK:v015-i02 */
@@ -873,7 +894,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v015-i01", "function": "cmd_process"},
-            {"id": "v015-i02", "function": "cmd_process"},
+            {"id": "v015-i02", "function": "cmd_process",
+             "shared_sanitizer": "v015-i01"},
         ],
         param_types_hex=0x0641,
     )
@@ -893,8 +915,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
 \t                                TEE_PARAM_TYPE_MEMREF_INOUT,
 \t                                TEE_PARAM_TYPE_NONE,
 \t                                TEE_PARAM_TYPE_NONE);
-\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS; /* SOURCE:v016-i01 */
-\tvoid *buf = my_alloc(params[0].value.a);
+\tif (param_types != exp) return TEE_ERROR_BAD_PARAMETERS;
+\tvoid *buf = my_alloc(params[0].value.a); /* SOURCE:v016-i01 */
 \tint tmp_arr[20];
 \ttmp_arr[params[0].value.a] = 55; /* SINK:v016-i02 */
 \t(void)buf;
@@ -928,7 +950,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v016-i01", "function": "my_alloc"},
-            {"id": "v016-i02", "function": "cmd_process"},
+            {"id": "v016-i02", "function": "cmd_process",
+             "shared_source": "v016-i01", "shared_sanitizer": "v016-i01"},
         ],
         param_types_hex=0x0061,
     )
@@ -993,8 +1016,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v017-i01", "function": "cmd_process"},
-            {"id": "v017-i02", "function": "cmd_process"},
-            {"id": "v017-i03", "function": "cmd_process"},
+            {"id": "v017-i02", "function": "cmd_process",
+             "shared_source": "v017-i01", "shared_sanitizer": "v017-i01"},
+            {"id": "v017-i03", "function": "cmd_process",
+             "shared_source": "v017-i01", "shared_sanitizer": "v017-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1057,7 +1082,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v018-i01", "function": "cmd_process"},
-            {"id": "v018-i02", "function": "cmd_process"},
+            {"id": "v018-i02", "function": "cmd_process",
+             "shared_source": "v018-i01", "shared_sanitizer": "v018-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1116,8 +1142,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v019-i01", "function": "cmd_process"},
-            {"id": "v019-i02", "function": "cmd_process"},
-            {"id": "v019-i03", "function": "cmd_process"},
+            {"id": "v019-i02", "function": "cmd_process",
+             "shared_source": "v019-i01", "shared_sanitizer": "v019-i01"},
+            {"id": "v019-i03", "function": "cmd_process",
+             "shared_source": "v019-i01", "shared_sanitizer": "v019-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1179,7 +1207,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v020-i01", "function": "cmd_process"},
-            {"id": "v020-i02", "function": "process_data"},
+            {"id": "v020-i02", "function": "process_data",
+             "shared_source": "v020-i01", "shared_sanitizer": "v020-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1240,8 +1269,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v021-i01", "function": "cmd_process"},
-            {"id": "v021-i02", "function": "cmd_process"},
-            {"id": "v021-i03", "function": "cmd_process"},
+            {"id": "v021-i02", "function": "cmd_process",
+             "shared_source": "v021-i01", "shared_sanitizer": "v021-i01"},
+            {"id": "v021-i03", "function": "cmd_process",
+             "shared_source": "v021-i01", "shared_sanitizer": "v021-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1307,7 +1338,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v022-i01", "function": "cmd_process"},
-            {"id": "v022-i02", "function": "process_callback"},
+            {"id": "v022-i02", "function": "process_callback",
+             "shared_source": "v022-i01", "shared_sanitizer": "v022-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1363,8 +1395,10 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v023-i01", "function": "cmd_process"},
-            {"id": "v023-i02", "function": "cmd_process"},
-            {"id": "v023-i03", "function": "cmd_process"},
+            {"id": "v023-i02", "function": "cmd_process",
+             "shared_source": "v023-i01", "shared_sanitizer": "v023-i01"},
+            {"id": "v023-i03", "function": "cmd_process",
+             "shared_source": "v023-i01", "shared_sanitizer": "v023-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1424,7 +1458,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v024-i01", "function": "cmd_process"},
-            {"id": "v024-i02", "function": "cmd_process"},
+            {"id": "v024-i02", "function": "cmd_process",
+             "shared_source": "v024-i01", "shared_sanitizer": "v024-i01"},
         ],
         param_types_hex=0x0006,
     )
@@ -1509,7 +1544,8 @@ static TEE_Result cmd_process(uint32_t param_types, TEE_Param params[4])
         safe_body=safe,
         vuln_markers=[
             {"id": "v025-i01", "function": "cmd_process"},
-            {"id": "v025-i02", "function": "cmd_process"},
+            {"id": "v025-i02", "function": "cmd_process",
+             "shared_source": "v025-i01", "shared_sanitizer": "v025-i01"},
         ],
         param_types_hex=0x0006,
     )

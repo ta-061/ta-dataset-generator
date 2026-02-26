@@ -9,10 +9,12 @@ Scaffold files are embedded from OP-TEE official optee_examples/hello_world
 (BSD-2-Clause). No external scaffold directory is required.
 
 Usage:
-    python3 main.py --output-dir RQ3_Dataset
+    python3 main.py --output-dir TA_Dataset
 """
 
 import argparse
+import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,20 +23,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from templates import TEMPLATE_REGISTRY, TemplateResult
-from emitters import assemble_entry_c, write_variant_project
+from emitters import assemble_entry_c, write_variant_project, write_toctou_oracle
 from labels import (
     CATEGORY_MAP,
     extract_sink_lines,
+    extract_markers,
     resolve_vuln_instances,
+    compute_detection_group,
     build_ground_truth_rows,
     write_ground_truth_csv,
     write_taint_labels_csv,
     write_sanitizer_labels_csv,
     write_manifest,
-    validate_safe_invariant,
     TaintCheckpoint,
     SanitizerEntry,
 )
+from validators import (
+    validate_safe_invariant,
+    validate_marker_consistency,
+    validate_safe_sink_args,
+    validate_unsafe_safe_consistency,
+    validate_ivw_safe_invariant,
+    validate_dus_safe_invariant,
+    validate_round_trip,
+    validate_file_existence,
+    validate_unsafe_safe_diff,
+    validate_sink_line_content,
+    validate_udo_unsafe_not_sanitized,
+    validate_source_line_content,
+    validate_udo_safe_enc_exists,
+)
+from metrics import compute_structural_shift_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -176,38 +195,55 @@ def compute_pad(category_key: str, body: str) -> int:
     return 0
 
 
-def adjust_and_assemble(category_key: str, body: str) -> str:
+def adjust_and_assemble(category_key: str, body: str) -> tuple[str, dict]:
     """Assemble entry.c with PAD auto-adjustment loop.
 
-    Returns the assembled source code with correct line alignment.
+    Returns:
+        Tuple of (assembled source code, PAD convergence metadata)
     """
     pad = compute_pad(category_key, body)
+    converged = False
+    attempts_used = 0
 
     for attempt in range(MAX_PAD_ATTEMPTS):
+        attempts_used = attempt + 1
         source = assemble_entry_c(body, pad_lines=pad)
         sink_lines = extract_sink_lines(source)
 
         if not sink_lines:
+            converged = True
             break
 
         if category_key == "UDO":
             if all(l < LINE_THRESHOLD for l in sink_lines):
+                converged = True
                 break
-            # Reduce pad (shouldn't normally happen)
             excess = max(sink_lines) - LINE_THRESHOLD + 1
             pad = max(0, pad - excess)
         elif category_key == "IVW":
             if all(l > LINE_THRESHOLD for l in sink_lines):
+                converged = True
                 break
             deficit = LINE_THRESHOLD - min(sink_lines) + 5
             pad += deficit
         elif category_key == "DUS":
+            converged = True
             break
     else:
         print(f"WARNING: Failed to align line numbers after {MAX_PAD_ATTEMPTS} attempts",
               file=sys.stderr)
 
-    return source
+    pad_info = {
+        "pad_lines": pad,
+        "attempts": attempts_used,
+        "converged": converged,
+        "sink_lines": sink_lines if sink_lines else [],
+        "threshold": LINE_THRESHOLD,
+        "constraint": f"< {LINE_THRESHOLD}" if category_key == "UDO"
+                      else f"> {LINE_THRESHOLD}" if category_key == "IVW"
+                      else "none",
+    }
+    return source, pad_info
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +270,161 @@ def generate_readme(variants: list[VariantSpec], output_dir: Path) -> None:
     ]
     for v in variants:
         lines.append(f"| {v.variant_id} | {v.variant_name} | {v.category_key} | {v.variant_type} |")
+
+    # ------------------------------------------------------------------
+    # Structural Shift Comparison: original benchmark vs RQ3 variants
+    # ------------------------------------------------------------------
+    lines.extend([
+        "",
+        "## Distribution Shift: Structural Feature Comparison",
+        "",
+        "The table below compares the structural features present in the **original "
+        "PartitioningE-Bench** (bad-partitioning, 75 instances) with those introduced "
+        "in the RQ3 variants. Features marked **New** are outside the original "
+        "benchmark distribution and constitute the structural shift being evaluated.",
+        "",
+        "### Feature Envelope Comparison",
+        "",
+        "| Structural Dimension | Original Benchmark (bad-partitioning) | RQ3 Dataset (this dataset) |",
+        "|---|---|---|",
+        "| Max call depth (from handler) | 2 | **3** (v001) |",
+        "| Data indirection | direct char[], TEE_Param member, void* ptr, "
+        "simple index arithmetic (a-3) | + **double pointer** (v004), **typedef alias** (v017), "
+        "**struct-based handle** (v002,v018), **multi-step computed** (v014: val\\*4+3), "
+        "**pointer arithmetic** (v009: *(base+offset)), **XOR derivation** (v006) |",
+        "| Control flow at sink | if/early-return, for-loop | + **switch per-case sinks** (v003), "
+        "**while-loop** (v010,v021), **dead-code conditional** (v005), "
+        "**nested if/else scope** (v012,v020), **loop over params[]** (v007) |",
+        "| Sink API | TEE_MemMove, snprintf, TEE_Malloc, strcmp, TEE_MemCompare, "
+        "arr[], value.a= | + **memcpy** (v001,v006), **strncpy** (v003), "
+        "**memcmp** (v023), **pointer deref** (v009) |",
+        "| Guard flaw type | (none — guards in original are correct or absent) | "
+        "**off-by-one** (v013), **wrong operator** (v015: \\|\\|→&&), "
+        "**signed/unsigned cast** (v011), **unreachable scope** (v012), "
+        "**dead-code sanitizer** (v005), **partial encrypt** (v008), "
+        "**wrapper hiding taint** (v016) |",
+        "| TOCTOU mechanism | TEE_Wait only, pointer aliasing | + **function call gap** (v020,v023,v025), "
+        "**loop re-read** (v021), **callback via function pointer** (v022), "
+        "**partial copy split access** (v024), **return value ignored** (v025) |",
+        "| Language features | (none user-defined) | **typedef** (v017), "
+        "**function pointer + callback** (v022) |",
+        "| Source pattern (IVW) | params[] direct at sink | params[] → **local variable** "
+        "(int, uint32_t, etc.) → derived use |",
+        "",
+        "### Per-Variant Structural Novelty",
+        "",
+        "Each row indicates which features of the variant are **absent from the "
+        "original benchmark**. This justifies each variant as a distribution-shift "
+        "test case.",
+        "",
+        "| ID | Category | Novel Features (not in original benchmark) |",
+        "|-----|----------|---------------------------------------------|",
+        "| v001 | UDO | Call depth 3, memcpy sink, 4 user-defined functions |",
+        "| v002 | UDO | Secret in user-defined struct (not TEE_Param), "
+        "struct member access via -> |",
+        "| v003 | UDO | switch-case with per-case different sink APIs "
+        "(memcpy/strncpy/snprintf), strncpy sink |",
+        "| v004 | UDO | Double pointer (char\\*\\*) indirection |",
+        "| v005 | UDO | Dead-code sanitizer (enc() inside always-false conditional) |",
+        "| v006 | UDO | XOR/shift data derivation before output, memcpy sink, "
+        "value.a assignment as output channel |",
+        "| v007 | UDO | for-loop iterating over params[0..2] array "
+        "(original loops over buffer content, not params array) |",
+        "| v008 | UDO | Partial encryption (key encrypted, IV leaked in same output) |",
+        "| v009 | IVW | Pointer arithmetic \\*(base+offset) instead of arr[idx] |",
+        "| v010 | IVW | while-loop with tainted bound, "
+        "two separate REE sources (memref.size + value.a) |",
+        "| v011 | IVW | Signed/unsigned type mismatch (int cast of uint32_t) |",
+        "| v012 | IVW | Guard in wrong scope (unreachable: inside else branch) |",
+        "| v013 | IVW | Off-by-one (\\<= vs \\<) |",
+        "| v014 | IVW | Multi-step computed index (val\\*4+3), "
+        "arithmetic amplification of tainted value |",
+        "| v015 | IVW | Wrong logical operator (\\|\\| vs &&) |",
+        "| v016 | IVW | Wrapper function hiding taint path (my\\_alloc → TEE\\_Malloc) |",
+        "| v017 | DUS | typedef alias for shm pointer (typedef char\\* shm\\_buf\\_t) |",
+        "| v018 | DUS | struct field storing shm pointer (struct shm\\_handle) |",
+        "| v019 | DUS | Explicit re-read from params[] after TEE\\_Wait "
+        "(original uses only cached void\\*) |",
+        "| v020 | DUS | Nested if + shm re-read in inner block, "
+        "function call gap TOCTOU |",
+        "| v021 | DUS | while-loop re-check TOCTOU (loop iteration gap) |",
+        "| v022 | DUS | Function pointer typedef, callback invocation, "
+        "indirect call TOCTOU |",
+        "| v023 | DUS | memcmp (libc) instead of TEE\\_MemCompare |",
+        "| v024 | DUS | Partial copy (header local, payload still shm), "
+        "split-access TOCTOU |",
+        "| v025 | DUS | Return value ignored "
+        "(validation func returns safe copy, caller uses original shm) |",
+    ])
+
+    # ------------------------------------------------------------------
+    # Quantitative Structural Shift Metrics (computed from feature vectors)
+    # ------------------------------------------------------------------
+    metrics = compute_structural_shift_metrics()
+    agg = metrics["aggregate"]
+    dims = metrics["per_dim"]
+    pvs = metrics["per_variant"]
+
+    lines.extend([
+        "",
+        "### Quantitative Shift Metrics",
+        "",
+        "Structural features are encoded as a binary feature vector across 7 dimensions "
+        f"({agg['n_features_total']} features total). "
+        "Each variant and the original benchmark are represented as subsets of this space.",
+        "",
+        "#### Aggregate Statistics",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Total features in taxonomy | {agg['n_features_total']} |",
+        f"| Features in original benchmark | {agg['n_original']} |",
+        f"| Novel features (not in original) | {agg['n_novel_defined']} |",
+        f"| Features used by RQ3 variants | {agg['n_rq3_used']} |",
+        f"| of which: in-distribution | {agg['n_rq3_shared']} |",
+        f"| of which: out-of-distribution (novel) | {agg['n_rq3_novel_used']} |",
+        f"| Novel feature ratio (novel / used) | {agg['novel_ratio']:.1%} |",
+        f"| Jaccard distance (orig vs RQ3) | {agg['jaccard_distance']:.3f} |",
+        "",
+        "**Jaccard distance** = 1 − |F_orig ∩ F_RQ3| / |F_orig ∪ F_RQ3| ; "
+        "0 = identical feature sets, 1 = no overlap.",
+        "",
+        "#### Per-Dimension Expansion",
+        "",
+        "| Dimension | Features in Original | Novel in RQ3 | Total | Expansion Ratio |",
+        "|-----------|---------------------|--------------|-------|-----------------|",
+    ])
+    for dim_key in sorted(dims.keys()):
+        d = dims[dim_key]
+        lines.append(
+            f"| {d['label']} | {d['n_original']} | {d['n_novel_used']} | "
+            f"{d['n_original'] + d['n_novel_used']} | "
+            f"×{d['expansion']:.2f} |"
+        )
+
+    lines.extend([
+        "",
+        "#### Per-Variant Novelty Score",
+        "",
+        "Novelty score = (# novel features) / (# total features of variant). "
+        "Higher score indicates greater structural distance from original benchmark.",
+        "",
+        "| ID | Cat. | Features | Novel | In-dist. | Novelty Score |",
+        "|-----|------|----------|-------|----------|---------------|",
+    ])
+    for vid in sorted(pvs.keys()):
+        p = pvs[vid]
+        cat = next((v.category_key for v in variants if v.variant_id == vid), "?")
+        lines.append(
+            f"| {vid} | {cat} | {p['n_total']} | {p['n_novel']} | "
+            f"{p['n_original']} | {p['novelty_score']:.2f} |"
+        )
+
+    # Average novelty score
+    avg_novelty = sum(p["novelty_score"] for p in pvs.values()) / len(pvs) if pvs else 0.0
+    lines.extend([
+        f"| **Average** | | | | | **{avg_novelty:.2f}** |",
+    ])
 
     lines.extend([
         "",
@@ -264,7 +455,7 @@ def generate_readme(variants: list[VariantSpec], output_dir: Path) -> None:
         "",
         "## Derivation",
         "Scaffold derived from OP-TEE official `optee_examples/hello_world` (BSD-2-Clause).",
-        "TA source (`entry.c`) generated by `rq3_dataset_generator/main.py`",
+        "TA source (`entry.c`) generated by `ta-dataset-generator/main.py`",
         "(template + parametric, no LLM code generation).",
     ])
 
@@ -282,23 +473,42 @@ def generate_dataset(output_dir: Path) -> None:
     all_gt_rows = []
     all_instance_ids = set()
     errors = []
+    verification_log = {}  # variant_id → verification details
 
     for spec in VARIANTS:
         print(f"Generating {spec.variant_id}: {spec.variant_name} ({spec.category_key})")
+
+        vlog: dict = {"variant_id": spec.variant_id, "category": spec.category_key}
 
         # 1. Get template result
         tpl_func = TEMPLATE_REGISTRY[spec.variant_id]
         result: TemplateResult = tpl_func()
 
         # 2. Assemble entry.c with PAD adjustment
-        unsafe_source = adjust_and_assemble(spec.category_key, result.unsafe_body)
-        safe_source = adjust_and_assemble(spec.category_key, result.safe_body)
+        # Compute PAD from unsafe body (which has SINK markers), then apply
+        # the SAME PAD to safe body so both versions have identical line structure.
+        unsafe_source, unsafe_pad = adjust_and_assemble(spec.category_key, result.unsafe_body)
+        safe_source = assemble_entry_c(result.safe_body, pad_lines=unsafe_pad["pad_lines"])
+        safe_pad = {
+            "pad_lines": unsafe_pad["pad_lines"],
+            "attempts": 0,
+            "converged": True,
+            "sink_lines": extract_sink_lines(safe_source),
+            "threshold": LINE_THRESHOLD,
+            "constraint": unsafe_pad["constraint"],
+            "note": "Reuses unsafe PAD for structural consistency",
+        }
+
+        # Log PAD convergence
+        vlog["pad"] = {
+            "unsafe": unsafe_pad,
+            "safe": safe_pad,
+        }
 
         # 3. Write project directories
         unsafe_dir, safe_dir = write_variant_project(
             output_dir=output_dir,
             variant_id=spec.variant_id,
-            variant_name=spec.variant_name,
             unsafe_source=unsafe_source,
             safe_source=safe_source,
         )
@@ -306,34 +516,175 @@ def generate_dataset(output_dir: Path) -> None:
         # 4. Resolve markers → VulnInstances
         vuln_instances = resolve_vuln_instances(
             unsafe_source, result.vuln_markers, spec.category_key,
+            safe_source=safe_source,
         )
 
+        # 4b. Compute detection groups
+        for vi in vuln_instances:
+            vi.group_start, vi.group_end = compute_detection_group(
+                unsafe_source, vi.sink_line,
+            )
+
         # 5. Validate
+        variant_errors = []
+
         # 5a. Instance ID uniqueness
         for vi in vuln_instances:
             if vi.instance_id in all_instance_ids:
-                errors.append(f"Duplicate instance_id: {vi.instance_id}")
+                variant_errors.append(f"Duplicate instance_id: {vi.instance_id}")
             all_instance_ids.add(vi.instance_id)
 
         # 5b. SINK line resolution
         for vi in vuln_instances:
             if vi.sink_line == 0:
-                errors.append(f"SINK marker not found for {vi.instance_id}")
+                variant_errors.append(f"SINK marker not found for {vi.instance_id}")
 
         # 5c. Line number band (UDO < 195, IVW > 195)
         for vi in vuln_instances:
             if spec.category_key == "UDO" and vi.sink_line >= LINE_THRESHOLD:
-                errors.append(
+                variant_errors.append(
                     f"UDO SINK line {vi.sink_line} >= {LINE_THRESHOLD} for {vi.instance_id}"
                 )
             elif spec.category_key == "IVW" and vi.sink_line <= LINE_THRESHOLD:
-                errors.append(
+                variant_errors.append(
                     f"IVW SINK line {vi.sink_line} <= {LINE_THRESHOLD} for {vi.instance_id}"
                 )
 
-        # 5d. Safe invariant (UDO only)
-        safe_errors = validate_safe_invariant(safe_source, vuln_instances[0].category if vuln_instances else "")
-        errors.extend(safe_errors)
+        # 5d. Marker consistency (unsafe SINK ↔ safe SANITIZER)
+        mc_errors = validate_marker_consistency(
+            unsafe_source, safe_source, result.vuln_markers, spec.category_key,
+        )
+        variant_errors.extend(mc_errors)
+
+        # 5e. Safe invariant — secret not on SINK line (UDO only)
+        si_errors = validate_safe_invariant(
+            safe_source, vuln_instances[0].category if vuln_instances else "",
+        )
+        variant_errors.extend(si_errors)
+
+        # 5f. Safe sink args — enc_out only, no secret at sink API (UDO only)
+        sa_errors = validate_safe_sink_args(
+            safe_source, vuln_instances[0].category if vuln_instances else "",
+        )
+        variant_errors.extend(sa_errors)
+
+        # 5g. SOURCE line resolution (G1)
+        for vi in vuln_instances:
+            if vi.source_line == 0:
+                variant_errors.append(f"SOURCE not resolved for {vi.instance_id}")
+
+        # 5h. SANITIZER line resolution (G2)
+        for vi in vuln_instances:
+            if vi.sanitizer_line is None or vi.sanitizer_line == 0:
+                variant_errors.append(f"SANITIZER not resolved for {vi.instance_id}")
+
+        # 5i. shared reference target validity (G3)
+        all_marker_ids = {vm["id"] for vm in result.vuln_markers}
+        for vm in result.vuln_markers:
+            ref = vm.get("shared_source")
+            if ref and ref not in all_marker_ids:
+                variant_errors.append(
+                    f"shared_source '{ref}' not found for {vm['id']}"
+                )
+            ref = vm.get("shared_sanitizer")
+            if ref and ref not in all_marker_ids:
+                variant_errors.append(
+                    f"shared_sanitizer '{ref}' not found for {vm['id']}"
+                )
+
+        # 5j. PAD convergence (G4)
+        if not unsafe_pad["converged"]:
+            variant_errors.append(
+                f"PAD failed to converge after {unsafe_pad['attempts']} attempts"
+            )
+
+        # 5k. Detection group validity
+        for vi in vuln_instances:
+            if not (vi.group_start <= vi.sink_line <= vi.group_end):
+                variant_errors.append(
+                    f"Detection group [{vi.group_start},{vi.group_end}] "
+                    f"does not contain sink_line {vi.sink_line} for {vi.instance_id}"
+                )
+
+        # 5l. Unsafe/safe line count consistency (FP2)
+        # Line count difference is expected (safe adds sanitizer code).
+        # Log as info, not error.
+        uc_notes = validate_unsafe_safe_consistency(unsafe_source, safe_source)
+        if uc_notes:
+            vlog["line_count_diff"] = uc_notes[0]
+
+        # 5m. IVW safe invariant: bounds check before sink (FP3)
+        ivw_errors = validate_ivw_safe_invariant(safe_source, spec.category_key)
+        variant_errors.extend(ivw_errors)
+
+        # 5n. DUS safe invariant: local copy pattern present (FP3)
+        dus_errors = validate_dus_safe_invariant(safe_source, spec.category_key)
+        variant_errors.extend(dus_errors)
+
+        # 5o. File existence on disk (FP4)
+        fe_errors = validate_file_existence(unsafe_dir)
+        fe_errors.extend(validate_file_existence(safe_dir))
+        variant_errors.extend(fe_errors)
+
+        # 5p. Round-trip verification: disk entry.c matches in-memory (FP5)
+        rt_errors = validate_round_trip(unsafe_dir / "ta" / "entry.c", unsafe_source)
+        rt_errors.extend(validate_round_trip(safe_dir / "ta" / "entry.c", safe_source))
+        variant_errors.extend(rt_errors)
+
+        # 5q. Unsafe ≠ safe code diff (FP6)
+        diff_errors = validate_unsafe_safe_diff(unsafe_source, safe_source)
+        variant_errors.extend(diff_errors)
+
+        # 5r. SINK line content — must contain executable code (FP7)
+        slc_errors = validate_sink_line_content(unsafe_source, result.vuln_markers)
+        variant_errors.extend(slc_errors)
+
+        # 5s. UDO unsafe must not already be sanitized (FP8)
+        uas_errors = validate_udo_unsafe_not_sanitized(
+            unsafe_source, result.vuln_markers, spec.category_key,
+        )
+        variant_errors.extend(uas_errors)
+
+        # 5t. SOURCE line content — must contain executable code (FP9)
+        src_errors = validate_source_line_content(unsafe_source, result.vuln_markers)
+        variant_errors.extend(src_errors)
+
+        # 5u. UDO safe must actually call enc() (FP10)
+        enc_errors = validate_udo_safe_enc_exists(safe_source, spec.category_key)
+        variant_errors.extend(enc_errors)
+
+        # Log validation results
+
+        # Resolved per-instance triad (after shared_source/shared_sanitizer inheritance)
+        vlog["resolved_instances"] = {}
+        for vi in vuln_instances:
+            vm_entry = next((vm for vm in result.vuln_markers if vm["id"] == vi.instance_id), {})
+            inst_info: dict = {
+                "source_line": vi.source_line,
+                "sink_line": vi.sink_line,
+                "sanitizer_line": vi.sanitizer_line,
+                "function": vi.function_name,
+                "complete": (vi.source_line > 0
+                             and vi.sink_line > 0
+                             and vi.sanitizer_line is not None
+                             and vi.sanitizer_line > 0),
+            }
+            if "shared_source" in vm_entry:
+                inst_info["source_inherited_from"] = vm_entry["shared_source"]
+            if "shared_sanitizer" in vm_entry:
+                inst_info["sanitizer_inherited_from"] = vm_entry["shared_sanitizer"]
+            vlog["resolved_instances"][vi.instance_id] = inst_info
+
+        # Raw markers present in C source (for auditing code-level presence)
+        vlog["markers"] = {
+            "unsafe": {iid: list(m.keys()) for iid, m in extract_markers(unsafe_source).items()},
+            "safe": {iid: list(m.keys()) for iid, m in extract_markers(safe_source).items()},
+        }
+        vlog["validation"] = {
+            "passed": len(variant_errors) == 0,
+            "errors": variant_errors,
+        }
+        errors.extend(variant_errors)
 
         # 6. Build ground truth rows
         gt_rows = build_ground_truth_rows(vuln_instances)
@@ -341,21 +692,18 @@ def generate_dataset(output_dir: Path) -> None:
 
         # 7. Write per-variant labels
         seq = int(spec.variant_id.replace("v", ""))
-        variant_dir = output_dir / f"variant_{seq:03d}_{spec.variant_name}"
+        variant_dir = output_dir / f"variant_{seq:03d}"
 
         # Per-variant ground truth
         write_ground_truth_csv(gt_rows, variant_dir / "ground_truth_labels.csv")
 
         # Flow labels
-        category_en, _ = CATEGORY_MAP.get(spec.category_key, (spec.category_key, ""))
-        category_prefix = category_en.split("_")[0]  # "unencrypted" / "weak" / "shared"
         flow_dir = variant_dir / "flow_labels"
 
         # Taint labels (from template result)
         if result.taint_flow:
             write_taint_labels_csv(result.taint_flow, flow_dir / f"{spec.category_key.lower()}_taint_labels.csv")
         else:
-            # Generate minimal taint labels from markers
             taint_cps = _generate_basic_taint_flow(unsafe_source, vuln_instances, spec.category_key)
             write_taint_labels_csv(taint_cps, flow_dir / f"{spec.category_key.lower()}_taint_labels.csv")
 
@@ -363,7 +711,6 @@ def generate_dataset(output_dir: Path) -> None:
         if result.sanitizers:
             write_sanitizer_labels_csv(result.sanitizers, flow_dir / f"{spec.category_key.lower()}_sanitizer_labels.csv")
         else:
-            # Generate minimal sanitizer labels from markers
             san_entries = _generate_basic_sanitizer_labels(safe_source, vuln_instances, spec.category_key)
             write_sanitizer_labels_csv(san_entries, flow_dir / f"{spec.category_key.lower()}_sanitizer_labels.csv")
 
@@ -377,26 +724,72 @@ def generate_dataset(output_dir: Path) -> None:
             safe_fix_description=spec.safe_fix_description,
             vuln_instances=vuln_instances,
             output_path=variant_dir / "manifest.json",
+            vuln_markers=result.vuln_markers,
         )
 
-    # 8. Write aggregated ground truth
+        # 8. DUS-TOCTOU oracle (TEE_Wait variants only)
+        if spec.category_key == "DUS" and spec.structural_features.get("toctou_window") == "TEE_Wait":
+            write_toctou_oracle(unsafe_dir, safe_dir)
+
+        verification_log[spec.variant_id] = vlog
+
+    # 9. Cross-variant checks (G5: ground truth row count)
+    if len(all_gt_rows) != len(all_instance_ids):
+        errors.append(
+            f"Ground truth row count ({len(all_gt_rows)}) != "
+            f"instance count ({len(all_instance_ids)})"
+        )
+
+    # 10. Write aggregated ground truth
     write_ground_truth_csv(all_gt_rows, output_dir / "ground_truth_labels.csv")
 
-    # 9. Generate README
+    # 11. Write verification log
+    vlog_path = output_dir / "verification_log.json"
+    with open(vlog_path, "w", encoding="utf-8") as f:
+        json.dump(verification_log, f, indent=2, ensure_ascii=False)
+
+    # 12. Generate README
     generate_readme(VARIANTS, output_dir)
 
-    # 10. Report
+    # 13. Report
     print(f"\nDataset generated: {output_dir}")
     print(f"  Variants: {len(VARIANTS)}")
     print(f"  Total instances: {len(all_gt_rows)}")
+    print(f"  Verification log: {vlog_path}")
 
     if errors:
-        print(f"\nWARNINGS ({len(errors)}):")
+        print(f"\nERRORS ({len(errors)}):")
         for e in errors:
             print(f"  - {e}")
         sys.exit(1)
     else:
         print("  All validations passed.")
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for basic label generation
+# ---------------------------------------------------------------------------
+
+def _find_enclosing_function(source: str, target_line: int) -> str:
+    """Find the C function name that encloses the given line number.
+
+    Scans backward from *target_line* looking for a top-level function
+    definition — i.e. a non-indented line that contains ``identifier(``
+    and is not a keyword / preprocessor directive / type definition.
+    Falls back to ``"(unknown)"`` if no match is found.
+    """
+    _SKIP = frozenset(('if', 'while', 'for', 'switch', 'do',
+                        'typedef', 'struct', 'enum', 'union'))
+    lines = source.splitlines()
+    for i in range(target_line - 1, -1, -1):
+        raw = lines[i]
+        # Only consider non-indented lines (function defs start at col 0)
+        if not raw or raw[0] in (' ', '\t', '#', '/', '{', '}', '*'):
+            continue
+        m = re.search(r'\b(\w+)\s*\(', raw)
+        if m and m.group(1) not in _SKIP:
+            return m.group(1)
+    return "(unknown)"
 
 
 def _generate_basic_taint_flow(
@@ -405,7 +798,6 @@ def _generate_basic_taint_flow(
     category_key: str,
 ) -> list[TaintCheckpoint]:
     """Generate basic taint flow labels from resolved markers."""
-    from labels import extract_markers
     markers = extract_markers(source)
 
     cps = []
@@ -429,9 +821,10 @@ def _generate_basic_taint_flow(
 
         if "SOURCE" in resolved:
             role = "secret_source" if category_key == "UDO" else "propagated"
+            src_func = _find_enclosing_function(source, resolved["SOURCE"])
             cps.append(TaintCheckpoint(
                 checkpoint_id=f"SOURCE:{vi.instance_id}",
-                function=vi.function_name,
+                function=src_func,
                 line=resolved["SOURCE"],
                 var="(see source code)",
                 role=role,
@@ -459,7 +852,6 @@ def _generate_basic_sanitizer_labels(
     category_key: str,
 ) -> list[SanitizerEntry]:
     """Generate basic sanitizer labels from safe version markers."""
-    from labels import extract_markers
     markers = extract_markers(safe_source)
 
     flow_name = {"UDO": "UDO", "IVW": "IVW", "DUS": "DUS"}.get(category_key, category_key)
@@ -488,9 +880,10 @@ def _generate_basic_sanitizer_labels(
     for vi in vuln_instances:
         resolved = markers.get(vi.instance_id, {})
         if "SANITIZER" in resolved:
+            san_func = _find_enclosing_function(safe_source, resolved["SANITIZER"])
             entries.append(SanitizerEntry(
                 flow=flow_name,
-                function=vi.function_name,
+                function=san_func,
                 line=resolved["SANITIZER"],
                 expression="(see source code)",
                 kind=kind_map.get(category_key, "unknown"),
@@ -512,8 +905,8 @@ def main():
     parser.add_argument(
         "--output-dir", "-o",
         type=Path,
-        default=Path("RQ3_Dataset"),
-        help="Output directory (default: RQ3_Dataset)",
+        default=Path("TA_Dataset"),
+        help="Output directory (default: TA_Dataset)",
     )
     args = parser.parse_args()
 

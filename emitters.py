@@ -305,14 +305,24 @@ void TA_CloseSessionEntryPoint(void __maybe_unused *sess_ctx)
 """
 
 ENC_DEC_STUBS = """\
-void enc(char *str)
-{
+/*
+ * Simple XOR-based encryption/decryption.
+ * In a real TA this would use TEE Crypto API (AES, etc.).
+ */
+static const char xor_key[] = "TA_ENCRYPT_KEY_2024";
 
+static void enc(char *str)
+{
+\tsize_t key_len = sizeof(xor_key) - 1;
+\tsize_t i;
+\tfor (i = 0; str[i] != '\\0'; i++)
+\t\tstr[i] ^= xor_key[i % key_len];
 }
 
-void dec(char *str)
+static void dec(char *str)
 {
-
+\t/* XOR encryption is symmetric: dec == enc */
+\tenc(str);
 }
 """
 
@@ -542,16 +552,14 @@ def write_entry_c(dst_dir: Path, source_code: str) -> None:
 def write_variant_project(
     output_dir: Path,
     variant_id: str,
-    variant_name: str,
     unsafe_source: str,
     safe_source: str,
 ) -> tuple[Path, Path]:
     """Write a complete variant project (unsafe + safe).
 
     Args:
-        output_dir: Root output directory (e.g., RQ3_Dataset/)
+        output_dir: Root output directory (e.g., TA_Dataset/)
         variant_id: e.g., "v001"
-        variant_name: e.g., "udo_deep_call_chain"
         unsafe_source: Complete entry.c for unsafe version
         safe_source: Complete entry.c for safe version
 
@@ -559,7 +567,7 @@ def write_variant_project(
         Tuple of (unsafe_dir, safe_dir)
     """
     seq = int(variant_id.replace("v", ""))
-    variant_dir_name = f"variant_{seq:03d}_{variant_name}"
+    variant_dir_name = f"variant_{seq:03d}"
     variant_dir = output_dir / variant_dir_name
 
     uuid_str = generate_uuid_for_variant(variant_id)
@@ -572,3 +580,131 @@ def write_variant_project(
         write_entry_c(subdir, source)
 
     return unsafe_dir, safe_dir
+
+
+# ---------------------------------------------------------------------------
+# DUS-TOCTOU behavioral oracle
+# ---------------------------------------------------------------------------
+
+TOCTOU_ORACLE_C = """\
+// SPDX-License-Identifier: BSD-2-Clause
+/*
+ * TOCTOU behavioral oracle — demonstrates that TEE_Wait creates a
+ * window in which the Normal World can overwrite shared memory.
+ *
+ * Expected behavior:
+ *   unsafe TA: validates "PASS", NW overwrites with "EVIL" during TEE_Wait,
+ *              TA re-reads and uses "EVIL" → TOCTOU vulnerability
+ *   safe TA:   copies shm to local before TEE_Wait, uses local copy →
+ *              NW overwrite has no effect
+ *
+ * Build: link against libteec and libpthread
+ *   $(CC) -o toctou_test toctou_test.c -lteec -lpthread
+ */
+
+#include <err.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+
+#include <tee_client_api.h>
+#include <hello_world_ta.h>
+
+#define SHM_SIZE 256
+
+/* Shared state between main thread and attacker thread */
+static volatile int ready = 0;
+static TEEC_SharedMemory shm;
+static TEEC_Context ctx;
+
+static void *attacker_thread(void *arg)
+{
+\t(void)arg;
+\t/* Wait until the TA command has been invoked */
+\twhile (!ready)
+\t\tusleep(1000);
+
+\t/*
+\t * Overwrite shared memory while TA is in TEE_Wait.
+\t * The TA validated "PASS" but now sees "EVIL".
+\t */
+\tusleep(50000); /* 50ms — within typical TEE_Wait(100ms) window */
+\tmemcpy(shm.buffer, "EVIL", 5);
+\tfprintf(stderr, "[attacker] Overwrote shm with 'EVIL'\\n");
+\treturn NULL;
+}
+
+int main(void)
+{
+\tTEEC_Result res;
+\tTEEC_Session sess;
+\tTEEC_Operation op;
+\tTEEC_UUID uuid = TA_HELLO_WORLD_UUID;
+\tuint32_t err_origin;
+\tpthread_t tid;
+
+\tres = TEEC_InitializeContext(NULL, &ctx);
+\tif (res != TEEC_SUCCESS)
+\t\terrx(1, "InitializeContext: 0x%x", res);
+
+\tres = TEEC_OpenSession(&ctx, &sess, &uuid,
+\t\t\t       TEEC_LOGIN_PUBLIC, NULL, NULL, &err_origin);
+\tif (res != TEEC_SUCCESS)
+\t\terrx(1, "OpenSession: 0x%x (origin 0x%x)", res, err_origin);
+
+\t/* Register shared memory */
+\tshm.size = SHM_SIZE;
+\tshm.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
+\tres = TEEC_AllocateSharedMemory(&ctx, &shm);
+\tif (res != TEEC_SUCCESS)
+\t\terrx(1, "AllocateSharedMemory: 0x%x", res);
+
+\t/* Write initial valid value */
+\tmemset(shm.buffer, 0, SHM_SIZE);
+\tmemcpy(shm.buffer, "PASS", 5);
+
+\t/* Start attacker thread */
+\tpthread_create(&tid, NULL, attacker_thread, NULL);
+
+\t/* Invoke TA command */
+\tmemset(&op, 0, sizeof(op));
+\top.paramTypes = TEEC_PARAM_TYPES(
+\t\tTEEC_MEMREF_PARTIAL_INOUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
+\top.params[0].memref.parent = &shm;
+\top.params[0].memref.offset = 0;
+\top.params[0].memref.size = SHM_SIZE;
+
+\tready = 1; /* Signal attacker */
+\tprintf("[host] Invoking TA...\\n");
+\tres = TEEC_InvokeCommand(&sess, TA_HELLO_WORLD_CMD_VARIANT, &op,
+\t\t\t\t &err_origin);
+
+\tpthread_join(tid, NULL);
+
+\tif (res == TEEC_SUCCESS)
+\t\tprintf("[host] TA returned SUCCESS — used value from shm after wait\\n");
+\telse
+\t\tprintf("[host] TA returned 0x%x — rejected modified shm\\n", res);
+
+\t/*
+\t * Interpretation:
+\t *   unsafe: returns SUCCESS (re-read "EVIL" from shm, TOCTOU exploited)
+\t *   safe:   returns SUCCESS with local copy of "PASS" (NW overwrite ignored)
+\t */
+
+\tTEEC_ReleaseSharedMemory(&shm);
+\tTEEC_CloseSession(&sess);
+\tTEEC_FinalizeContext(&ctx);
+
+\treturn 0;
+}
+"""
+
+
+def write_toctou_oracle(unsafe_dir: Path, safe_dir: Path) -> None:
+    """Write TOCTOU behavioral oracle test for DUS TEE_Wait variants."""
+    for d in (unsafe_dir, safe_dir):
+        host_dir = d / "host"
+        host_dir.mkdir(parents=True, exist_ok=True)
+        (host_dir / "toctou_test.c").write_text(TOCTOU_ORACLE_C)
